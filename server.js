@@ -50,6 +50,13 @@ async function ensureDirectoryForFile(filePath) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
 }
 
+async function removePath(targetPath) {
+  await fs.rm(targetPath, {
+    recursive: true,
+    force: true
+  });
+}
+
 async function fileInfo(filePath) {
   try {
     const stat = await fs.stat(filePath);
@@ -142,28 +149,12 @@ function parseRideFromText(rawText) {
     return true;
   });
 
-  let vehicle = "";
-  let from = "";
-  let to = "";
-
-  if (cleanedLines.length > 0) {
-    vehicle = cleanedLines[0] || "";
-  }
-
-  if (cleanedLines.length > 1) {
-    from = cleanedLines[1] || "";
-  }
-
-  if (cleanedLines.length > 2) {
-    to = cleanedLines[2] || "";
-  }
-
   return {
     id: createRideId(text),
-    vehicle,
+    vehicle: cleanedLines[0] || "",
     date: dateMatch ? dateMatch[0] : "",
-    from,
-    to,
+    from: cleanedLines[1] || "",
+    to: cleanedLines[2] || "",
     price: priceMatch ? priceMatch[0].toUpperCase() : "",
     rawText: text
   };
@@ -197,6 +188,7 @@ async function fillFirstAvailable(page, selectors, value) {
     const locator = page.locator(selector).first();
 
     if ((await locator.count().catch(() => 0)) > 0) {
+      await locator.fill("");
       await locator.fill(value);
       return true;
     }
@@ -210,12 +202,68 @@ async function clickFirstAvailable(page, selectors) {
     const locator = page.locator(selector).first();
 
     if ((await locator.count().catch(() => 0)) > 0) {
-      await locator.click();
+      await locator.click({ timeout: 10000, force: true });
       return true;
     }
   }
 
   return false;
+}
+
+async function clickSignInRobust(page) {
+  const selectors = [
+    'button[type="submit"]',
+    'button:has-text("Sign in")',
+    'button:has-text("Login")',
+    'button:has-text("Log in")',
+    'button:has-text("Submit")',
+    '[role="button"]:has-text("Sign in")',
+    '[role="button"]:has-text("Login")',
+    'input[type="submit"]',
+    'text=/^\\s*Sign\\s*in\\s*$/i',
+    'text=/^\\s*Login\\s*$/i'
+  ];
+
+  const clickedBySelector = await clickFirstAvailable(page, selectors);
+
+  if (clickedBySelector) {
+    return {
+      clicked: true,
+      method: "selector"
+    };
+  }
+
+  const clickedByEvaluate = await page.evaluate(() => {
+    const elements = Array.from(document.querySelectorAll("button, [role='button'], input, div, span, a"));
+
+    const target = elements.find((element) => {
+      const text = (element.innerText || element.textContent || element.value || "").trim().toLowerCase();
+      return text === "sign in" || text === "login" || text === "log in";
+    });
+
+    if (!target) {
+      return false;
+    }
+
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    return true;
+  }).catch(() => false);
+
+  if (clickedByEvaluate) {
+    return {
+      clicked: true,
+      method: "evaluate"
+    };
+  }
+
+  await page.keyboard.press("Enter");
+
+  return {
+    clicked: true,
+    method: "enter"
+  };
 }
 
 async function maybeLogin(page) {
@@ -267,32 +315,40 @@ async function maybeLogin(page) {
     };
   }
 
-  const submitSelectors = [
-    'button[type="submit"]',
-    'button:has-text("Login")',
-    'button:has-text("Log in")',
-    'button:has-text("Sign in")',
-    'button:has-text("Submit")',
-    'input[type="submit"]'
-  ];
+  console.log("Credenciales escritas. Intentando presionar Sign in...");
 
-  const clicked = await clickFirstAvailable(page, submitSelectors);
-
-  if (!clicked) {
-    await page.keyboard.press("Enter");
-  }
+  const clickResult = await clickSignInRobust(page);
+  console.log(`Click login ejecutado con método: ${clickResult.method}`);
 
   await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-  await waitSoft(page, 5000);
+  await waitSoft(page, 8000);
 
-  const stillLoggedOut = await detectLoggedOut(page);
+  const bodyTextAfter = (await safeBodyText(page)).toLowerCase();
 
-  if (stillLoggedOut) {
+  if (
+    bodyTextAfter.includes("invalid") ||
+    bodyTextAfter.includes("incorrect") ||
+    bodyTextAfter.includes("wrong password") ||
+    bodyTextAfter.includes("forgot my password")
+  ) {
+    await saveDebugFiles(page);
     return {
       attempted: true,
       success: false,
       message:
-        "Se intentó iniciar sesión, pero parece que no entró. Puede haber captcha, 2FA o selectores distintos."
+        "Elife parece indicar credenciales inválidas o login no completado. Revisa correo/password en variables de entorno."
+    };
+  }
+
+  const stillLoggedOut = await detectLoggedOut(page);
+
+  if (stillLoggedOut) {
+    await saveDebugFiles(page);
+    return {
+      attempted: true,
+      success: false,
+      message:
+        "Se intentó iniciar sesión, pero parece que no entró. Puede haber captcha, 2FA o el botón de login requiere otro ajuste."
     };
   }
 
@@ -330,14 +386,14 @@ async function goToRidePool(page) {
   const ridePoolText = page.locator("text=/Ride\\s*Pool/i").first();
 
   if ((await ridePoolText.count().catch(() => 0)) > 0) {
-    await ridePoolText.click().catch(() => {});
+    await ridePoolText.click({ force: true }).catch(() => {});
     await waitSoft(page, 2000);
   }
 
   const availableText = page.locator("text=/Available/i").first();
 
   if ((await availableText.count().catch(() => 0)) > 0) {
-    await availableText.click().catch(() => {});
+    await availableText.click({ force: true }).catch(() => {});
     await waitSoft(page, 2000);
   }
 }
@@ -552,6 +608,24 @@ app.get("/debug/screenshot", requireApiKey, async (req, res) => {
       error: "No existe last-screenshot.png todavía. Ejecuta /check primero."
     });
   }
+});
+
+app.post("/debug/clear-browser", requireApiKey, async (req, res) => {
+  if (isChecking) {
+    return res.status(409).json({
+      ok: false,
+      error: "Hay un chequeo en proceso. Intenta limpiar el navegador en unos segundos."
+    });
+  }
+
+  await removePath(USER_DATA_DIR);
+  await fs.mkdir(USER_DATA_DIR, { recursive: true });
+
+  res.json({
+    ok: true,
+    message: "Sesión del navegador eliminada correctamente",
+    userDataDir: USER_DATA_DIR
+  });
 });
 
 app.post("/reset-seen", requireApiKey, async (req, res) => {
