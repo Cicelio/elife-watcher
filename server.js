@@ -50,6 +50,23 @@ async function ensureDirectoryForFile(filePath) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
 }
 
+async function fileInfo(filePath) {
+  try {
+    const stat = await fs.stat(filePath);
+    return {
+      exists: true,
+      path: filePath,
+      sizeBytes: stat.size,
+      updatedAt: stat.mtime.toISOString()
+    };
+  } catch {
+    return {
+      exists: false,
+      path: filePath
+    };
+  }
+}
+
 async function loadSeenState() {
   try {
     const content = await fs.readFile(SEEN_RIDES_FILE, "utf8");
@@ -266,7 +283,7 @@ async function maybeLogin(page) {
   }
 
   await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-  await waitSoft(page, 4000);
+  await waitSoft(page, 5000);
 
   const stillLoggedOut = await detectLoggedOut(page);
 
@@ -500,6 +517,40 @@ app.get("/check", requireApiKey, async (req, res) => {
     });
   } finally {
     isChecking = false;
+  }
+});
+
+app.get("/debug/status", requireApiKey, async (req, res) => {
+  res.json({
+    ok: true,
+    screenshot: await fileInfo(DEBUG_SCREENSHOT_FILE),
+    html: await fileInfo(DEBUG_HTML_FILE),
+    seenRides: await fileInfo(SEEN_RIDES_FILE),
+    userDataDir: USER_DATA_DIR
+  });
+});
+
+app.get("/debug/html", requireApiKey, async (req, res) => {
+  try {
+    await fs.access(DEBUG_HTML_FILE);
+    res.type("html").sendFile(DEBUG_HTML_FILE);
+  } catch {
+    res.status(404).json({
+      ok: false,
+      error: "No existe last-page.html todavía. Ejecuta /check primero."
+    });
+  }
+});
+
+app.get("/debug/screenshot", requireApiKey, async (req, res) => {
+  try {
+    await fs.access(DEBUG_SCREENSHOT_FILE);
+    res.type("png").sendFile(DEBUG_SCREENSHOT_FILE);
+  } catch {
+    res.status(404).json({
+      ok: false,
+      error: "No existe last-screenshot.png todavía. Ejecuta /check primero."
+    });
   }
 });
 
