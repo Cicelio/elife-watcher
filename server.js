@@ -25,8 +25,18 @@ const USER_DATA_DIR = process.env.USER_DATA_DIR || "/app/data/browser";
 const DEBUG_SCREENSHOT_FILE =
   process.env.DEBUG_SCREENSHOT_FILE || "/app/data/last-screenshot.png";
 const DEBUG_HTML_FILE = process.env.DEBUG_HTML_FILE || "/app/data/last-page.html";
+const DEBUG_TEXT_FILE = process.env.DEBUG_TEXT_FILE || "/app/data/last-body.txt";
 
 let isChecking = false;
+
+class ManualActionRequiredError extends Error {
+  constructor(reason, message) {
+    super(message);
+    this.name = "ManualActionRequiredError";
+    this.reason = reason;
+    this.manualActionRequired = true;
+  }
+}
 
 app.use(express.json());
 
@@ -51,10 +61,7 @@ async function ensureDirectoryForFile(filePath) {
 }
 
 async function removePath(targetPath) {
-  await fs.rm(targetPath, {
-    recursive: true,
-    force: true
-  });
+  await fs.rm(targetPath, { recursive: true, force: true });
 }
 
 async function fileInfo(filePath) {
@@ -106,6 +113,7 @@ async function saveDebugFiles(page) {
   try {
     await ensureDirectoryForFile(DEBUG_SCREENSHOT_FILE);
     await ensureDirectoryForFile(DEBUG_HTML_FILE);
+    await ensureDirectoryForFile(DEBUG_TEXT_FILE);
 
     await page.screenshot({
       path: DEBUG_SCREENSHOT_FILE,
@@ -114,6 +122,9 @@ async function saveDebugFiles(page) {
 
     const html = await page.content();
     await fs.writeFile(DEBUG_HTML_FILE, html, "utf8");
+
+    const text = await page.locator("body").innerText().catch(() => "");
+    await fs.writeFile(DEBUG_TEXT_FILE, text, "utf8");
   } catch (error) {
     console.error("No se pudieron guardar archivos debug:", error.message);
   }
@@ -168,6 +179,19 @@ async function safeBodyText(page) {
   return normalizeText(await page.locator("body").innerText().catch(() => ""));
 }
 
+async function detectSupplierAgreement(page) {
+  const bodyText = (await safeBodyText(page)).toLowerCase();
+  const title = (await page.title().catch(() => "")).toLowerCase();
+
+  return (
+    title.includes("supplier agreement") ||
+    bodyText.includes("supplier agreement") ||
+    bodyText.includes("elife supplier agreement") ||
+    bodyText.includes("this is a binding contract") ||
+    bodyText.includes("please scroll down to view all content")
+  );
+}
+
 async function detectLoggedOut(page) {
   const currentUrl = page.url().toLowerCase();
   const bodyText = (await safeBodyText(page)).toLowerCase();
@@ -177,9 +201,9 @@ async function detectLoggedOut(page) {
   return (
     passwordInputs > 0 ||
     currentUrl.includes("login") ||
+    bodyText.includes("welcome to elife") ||
     bodyText.includes("sign in") ||
-    bodyText.includes("log in") ||
-    bodyText.includes("login")
+    bodyText.includes("log in")
   );
 }
 
@@ -227,10 +251,7 @@ async function clickSignInRobust(page) {
   const clickedBySelector = await clickFirstAvailable(page, selectors);
 
   if (clickedBySelector) {
-    return {
-      clicked: true,
-      method: "selector"
-    };
+    return { clicked: true, method: "selector" };
   }
 
   const clickedByEvaluate = await page.evaluate(() => {
@@ -241,9 +262,7 @@ async function clickSignInRobust(page) {
       return text === "sign in" || text === "login" || text === "log in";
     });
 
-    if (!target) {
-      return false;
-    }
+    if (!target) return false;
 
     target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
     target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
@@ -252,21 +271,22 @@ async function clickSignInRobust(page) {
   }).catch(() => false);
 
   if (clickedByEvaluate) {
-    return {
-      clicked: true,
-      method: "evaluate"
-    };
+    return { clicked: true, method: "evaluate" };
   }
 
   await page.keyboard.press("Enter");
-
-  return {
-    clicked: true,
-    method: "enter"
-  };
+  return { clicked: true, method: "enter" };
 }
 
 async function maybeLogin(page) {
+  if (await detectSupplierAgreement(page)) {
+    await saveDebugFiles(page);
+    throw new ManualActionRequiredError(
+      "SUPPLIER_AGREEMENT",
+      "Elife requiere acción manual en Supplier Agreement antes de continuar."
+    );
+  }
+
   const loggedOut = await detectLoggedOut(page);
 
   if (!loggedOut) {
@@ -321,22 +341,32 @@ async function maybeLogin(page) {
   console.log(`Click login ejecutado con método: ${clickResult.method}`);
 
   await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-  await waitSoft(page, 8000);
+  await waitSoft(page, 9000);
+
+  if (await detectSupplierAgreement(page)) {
+    await saveDebugFiles(page);
+    throw new ManualActionRequiredError(
+      "SUPPLIER_AGREEMENT",
+      "Elife requiere acción manual en Supplier Agreement antes de continuar."
+    );
+  }
 
   const bodyTextAfter = (await safeBodyText(page)).toLowerCase();
 
   if (
-    bodyTextAfter.includes("invalid") ||
-    bodyTextAfter.includes("incorrect") ||
+    bodyTextAfter.includes("invalid password") ||
+    bodyTextAfter.includes("invalid account") ||
+    bodyTextAfter.includes("incorrect password") ||
     bodyTextAfter.includes("wrong password") ||
-    bodyTextAfter.includes("forgot my password")
+    bodyTextAfter.includes("invalid username") ||
+    bodyTextAfter.includes("user not found")
   ) {
     await saveDebugFiles(page);
     return {
       attempted: true,
       success: false,
       message:
-        "Elife parece indicar credenciales inválidas o login no completado. Revisa correo/password en variables de entorno."
+        "Elife indica credenciales inválidas. Revisa correo/password en variables de entorno."
     };
   }
 
@@ -348,7 +378,7 @@ async function maybeLogin(page) {
       attempted: true,
       success: false,
       message:
-        "Se intentó iniciar sesión, pero parece que no entró. Puede haber captcha, 2FA o el botón de login requiere otro ajuste."
+        "Se intentó iniciar sesión, pero todavía está en pantalla de login."
     };
   }
 
@@ -368,6 +398,14 @@ async function goToRidePool(page) {
   await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
   await waitSoft(page, 3000);
 
+  if (await detectSupplierAgreement(page)) {
+    await saveDebugFiles(page);
+    throw new ManualActionRequiredError(
+      "SUPPLIER_AGREEMENT",
+      "Elife requiere acción manual en Supplier Agreement antes de continuar."
+    );
+  }
+
   const loginResult = await maybeLogin(page);
 
   if (!loginResult.success) {
@@ -382,6 +420,14 @@ async function goToRidePool(page) {
 
   await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
   await waitSoft(page, 3000);
+
+  if (await detectSupplierAgreement(page)) {
+    await saveDebugFiles(page);
+    throw new ManualActionRequiredError(
+      "SUPPLIER_AGREEMENT",
+      "Elife requiere acción manual en Supplier Agreement antes de continuar."
+    );
+  }
 
   const ridePoolText = page.locator("text=/Ride\\s*Pool/i").first();
 
@@ -467,17 +513,10 @@ async function checkElife() {
 
   const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: HEADLESS,
-    viewport: {
-      width: 1600,
-      height: 1000
-    },
+    viewport: { width: 1600, height: 1000 },
     locale: "en-US",
     timezoneId: "America/Costa_Rica",
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu"
-    ]
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
   });
 
   const page = context.pages()[0] || (await context.newPage());
@@ -507,6 +546,7 @@ async function checkElife() {
     return {
       ok: true,
       checkedAt,
+      manualActionRequired: false,
       totalRidesVisible: rides.length,
       newRides: newRides.length > 0,
       newRideCount: newRides.length,
@@ -562,13 +602,30 @@ app.get("/check", requireApiKey, async (req, res) => {
   } catch (error) {
     console.error("Error en /check:", error);
 
+    if (error instanceof ManualActionRequiredError || error.manualActionRequired) {
+      return res.status(200).json({
+        ok: false,
+        manualActionRequired: true,
+        reason: error.reason || "MANUAL_ACTION_REQUIRED",
+        message: error.message,
+        checkedAt: new Date().toISOString(),
+        debug: {
+          screenshot: DEBUG_SCREENSHOT_FILE,
+          html: DEBUG_HTML_FILE,
+          text: DEBUG_TEXT_FILE
+        }
+      });
+    }
+
     return res.status(500).json({
       ok: false,
+      manualActionRequired: false,
       error: error.message,
       checkedAt: new Date().toISOString(),
       debug: {
         screenshot: DEBUG_SCREENSHOT_FILE,
-        html: DEBUG_HTML_FILE
+        html: DEBUG_HTML_FILE,
+        text: DEBUG_TEXT_FILE
       }
     });
   } finally {
@@ -581,6 +638,7 @@ app.get("/debug/status", requireApiKey, async (req, res) => {
     ok: true,
     screenshot: await fileInfo(DEBUG_SCREENSHOT_FILE),
     html: await fileInfo(DEBUG_HTML_FILE),
+    text: await fileInfo(DEBUG_TEXT_FILE),
     seenRides: await fileInfo(SEEN_RIDES_FILE),
     userDataDir: USER_DATA_DIR
   });
@@ -594,6 +652,18 @@ app.get("/debug/html", requireApiKey, async (req, res) => {
     res.status(404).json({
       ok: false,
       error: "No existe last-page.html todavía. Ejecuta /check primero."
+    });
+  }
+});
+
+app.get("/debug/text", requireApiKey, async (req, res) => {
+  try {
+    await fs.access(DEBUG_TEXT_FILE);
+    res.type("text/plain").sendFile(DEBUG_TEXT_FILE);
+  } catch {
+    res.status(404).json({
+      ok: false,
+      error: "No existe last-body.txt todavía. Ejecuta /check primero."
     });
   }
 });
@@ -625,6 +695,27 @@ app.post("/debug/clear-browser", requireApiKey, async (req, res) => {
     ok: true,
     message: "Sesión del navegador eliminada correctamente",
     userDataDir: USER_DATA_DIR
+  });
+});
+
+app.post("/debug/clear-all", requireApiKey, async (req, res) => {
+  if (isChecking) {
+    return res.status(409).json({
+      ok: false,
+      error: "Hay un chequeo en proceso. Intenta limpiar datos en unos segundos."
+    });
+  }
+
+  await removePath(USER_DATA_DIR);
+  await removePath(SEEN_RIDES_FILE);
+  await removePath(DEBUG_SCREENSHOT_FILE);
+  await removePath(DEBUG_HTML_FILE);
+  await removePath(DEBUG_TEXT_FILE);
+  await fs.mkdir(USER_DATA_DIR, { recursive: true });
+
+  res.json({
+    ok: true,
+    message: "Datos del watcher eliminados correctamente"
   });
 });
 
