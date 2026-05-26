@@ -28,8 +28,9 @@ const DEBUG_HTML_FILE = process.env.DEBUG_HTML_FILE || "/app/data/last-page.html
 const DEBUG_TEXT_FILE = process.env.DEBUG_TEXT_FILE || "/app/data/last-body.txt";
 
 let isChecking = false;
-let manualContext = null;
-let manualPage = null;
+let agreementContext = null;
+let agreementPage = null;
+let agreementStartedAt = null;
 
 class ManualActionRequiredError extends Error {
   constructor(reason, message) {
@@ -40,7 +41,7 @@ class ManualActionRequiredError extends Error {
   }
 }
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 function normalizeText(value) {
   return String(value || "")
@@ -84,7 +85,6 @@ async function loadSeenState() {
   try {
     const content = await fs.readFile(SEEN_RIDES_FILE, "utf8");
     const parsed = JSON.parse(content);
-
     return {
       existed: true,
       ids: new Set(Array.isArray(parsed.seenRideIds) ? parsed.seenRideIds : [])
@@ -96,12 +96,10 @@ async function loadSeenState() {
 
 async function saveSeenState(seenRideIds) {
   await ensureDirectoryForFile(SEEN_RIDES_FILE);
-
   const payload = {
     updatedAt: new Date().toISOString(),
     seenRideIds: Array.from(seenRideIds)
   };
-
   await fs.writeFile(SEEN_RIDES_FILE, JSON.stringify(payload, null, 2), "utf8");
 }
 
@@ -131,6 +129,31 @@ async function safeBodyText(page) {
   return normalizeText(await page.locator("body").innerText().catch(() => ""));
 }
 
+async function detectSupplierAgreement(page) {
+  const bodyText = (await safeBodyText(page)).toLowerCase();
+  const title = (await page.title().catch(() => "")).toLowerCase();
+  return (
+    title.includes("supplier agreement") ||
+    bodyText.includes("supplier agreement") ||
+    bodyText.includes("elife supplier agreement") ||
+    bodyText.includes("this is a binding contract") ||
+    bodyText.includes("please scroll down to view all content")
+  );
+}
+
+async function detectLoggedOut(page) {
+  const currentUrl = page.url().toLowerCase();
+  const bodyText = (await safeBodyText(page)).toLowerCase();
+  const passwordInputs = await page.locator('input[type="password"]').count().catch(() => 0);
+  return (
+    passwordInputs > 0 ||
+    currentUrl.includes("login") ||
+    bodyText.includes("welcome to elife") ||
+    bodyText.includes("sign in") ||
+    bodyText.includes("log in")
+  );
+}
+
 async function getPageStatus(page) {
   const bodyText = await safeBodyText(page);
   const lower = bodyText.toLowerCase();
@@ -152,62 +175,33 @@ async function getPageStatus(page) {
     state,
     url: page.url(),
     title,
-    textSnippet: bodyText.slice(0, 1000),
-    screenshot: DEBUG_SCREENSHOT_FILE
+    textSnippet: bodyText.slice(0, 1500),
+    screenshot: DEBUG_SCREENSHOT_FILE,
+    text: DEBUG_TEXT_FILE,
+    html: DEBUG_HTML_FILE
   };
-}
-
-async function detectSupplierAgreement(page) {
-  const bodyText = (await safeBodyText(page)).toLowerCase();
-  const title = (await page.title().catch(() => "")).toLowerCase();
-
-  return (
-    title.includes("supplier agreement") ||
-    bodyText.includes("supplier agreement") ||
-    bodyText.includes("elife supplier agreement") ||
-    bodyText.includes("this is a binding contract") ||
-    bodyText.includes("please scroll down to view all content")
-  );
-}
-
-async function detectLoggedOut(page) {
-  const currentUrl = page.url().toLowerCase();
-  const bodyText = (await safeBodyText(page)).toLowerCase();
-  const passwordInputs = await page.locator('input[type="password"]').count().catch(() => 0);
-
-  return (
-    passwordInputs > 0 ||
-    currentUrl.includes("login") ||
-    bodyText.includes("welcome to elife") ||
-    bodyText.includes("sign in") ||
-    bodyText.includes("log in")
-  );
 }
 
 async function fillFirstAvailable(page, selectors, value) {
   for (const selector of selectors) {
     const locator = page.locator(selector).first();
-
     if ((await locator.count().catch(() => 0)) > 0) {
       await locator.fill("");
       await locator.fill(value);
       return true;
     }
   }
-
   return false;
 }
 
 async function clickFirstAvailable(page, selectors) {
   for (const selector of selectors) {
     const locator = page.locator(selector).first();
-
     if ((await locator.count().catch(() => 0)) > 0) {
       await locator.click({ timeout: 10000, force: true });
       return true;
     }
   }
-
   return false;
 }
 
@@ -226,7 +220,6 @@ async function clickSignInRobust(page) {
   ];
 
   const clickedBySelector = await clickFirstAvailable(page, selectors);
-
   if (clickedBySelector) return { clicked: true, method: "selector" };
 
   const clickedByEvaluate = await page.evaluate(() => {
@@ -235,9 +228,7 @@ async function clickSignInRobust(page) {
       const text = (element.innerText || element.textContent || element.value || "").trim().toLowerCase();
       return text === "sign in" || text === "login" || text === "log in";
     });
-
     if (!target) return false;
-
     target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
     target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
     target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
@@ -250,35 +241,20 @@ async function clickSignInRobust(page) {
   return { clicked: true, method: "enter" };
 }
 
-async function maybeLogin(page, manualMode = false) {
+async function loginIfNeeded(page) {
   if (await detectSupplierAgreement(page)) {
     await saveDebugFiles(page);
-
-    if (manualMode) {
-      return { attempted: false, success: false, manualActionRequired: true, reason: "SUPPLIER_AGREEMENT" };
-    }
-
-    throw new ManualActionRequiredError(
-      "SUPPLIER_AGREEMENT",
-      "Elife requiere acción manual en Supplier Agreement antes de continuar."
-    );
+    throw new ManualActionRequiredError("SUPPLIER_AGREEMENT", "Elife requiere aprobación humana para Supplier Agreement.");
   }
 
   const loggedOut = await detectLoggedOut(page);
-
   if (!loggedOut) {
     return { attempted: false, success: true, message: "La sesión parece estar activa" };
   }
 
   if (!ELIFE_EMAIL || !ELIFE_PASSWORD) {
-    return {
-      attempted: false,
-      success: false,
-      message: "Faltan ELIFE_EMAIL o ELIFE_PASSWORD en variables de entorno"
-    };
+    return { attempted: false, success: false, message: "Faltan ELIFE_EMAIL o ELIFE_PASSWORD en variables de entorno" };
   }
-
-  console.log("Sesión no detectada. Intentando iniciar sesión...");
 
   const emailSelectors = [
     'input[type="email"]',
@@ -301,6 +277,7 @@ async function maybeLogin(page, manualMode = false) {
   const passwordFilled = await fillFirstAvailable(page, passwordSelectors, ELIFE_PASSWORD);
 
   if (!emailFilled || !passwordFilled) {
+    await saveDebugFiles(page);
     return { attempted: true, success: false, message: "No se encontraron los campos de usuario y contraseña" };
   }
 
@@ -312,19 +289,10 @@ async function maybeLogin(page, manualMode = false) {
 
   if (await detectSupplierAgreement(page)) {
     await saveDebugFiles(page);
-
-    if (manualMode) {
-      return { attempted: true, success: false, manualActionRequired: true, reason: "SUPPLIER_AGREEMENT" };
-    }
-
-    throw new ManualActionRequiredError(
-      "SUPPLIER_AGREEMENT",
-      "Elife requiere acción manual en Supplier Agreement antes de continuar."
-    );
+    throw new ManualActionRequiredError("SUPPLIER_AGREEMENT", "Elife requiere aprobación humana para Supplier Agreement.");
   }
 
   const bodyTextAfter = (await safeBodyText(page)).toLowerCase();
-
   if (
     bodyTextAfter.includes("invalid password") ||
     bodyTextAfter.includes("invalid account") ||
@@ -334,16 +302,10 @@ async function maybeLogin(page, manualMode = false) {
     bodyTextAfter.includes("user not found")
   ) {
     await saveDebugFiles(page);
-    return {
-      attempted: true,
-      success: false,
-      message: "Elife indica credenciales inválidas. Revisa correo/password en variables de entorno."
-    };
+    return { attempted: true, success: false, message: "Elife indica credenciales inválidas." };
   }
 
-  const stillLoggedOut = await detectLoggedOut(page);
-
-  if (stillLoggedOut) {
+  if (await detectLoggedOut(page)) {
     await saveDebugFiles(page);
     return { attempted: true, success: false, message: "Se intentó iniciar sesión, pero todavía está en pantalla de login." };
   }
@@ -361,22 +323,47 @@ async function launchPersistent() {
   });
 }
 
-async function getManualPage() {
-  if (manualContext && manualPage) return manualPage;
-
-  manualContext = await launchPersistent();
-  manualPage = manualContext.pages()[0] || (await manualContext.newPage());
-
-  return manualPage;
+async function getAgreementPage() {
+  if (agreementContext && agreementPage) return agreementPage;
+  agreementContext = await launchPersistent();
+  agreementPage = agreementContext.pages()[0] || (await agreementContext.newPage());
+  agreementStartedAt = new Date().toISOString();
+  return agreementPage;
 }
 
-async function closeManualSession() {
-  if (manualContext) {
-    await manualContext.close().catch(() => {});
-  }
+async function closeAgreementSession() {
+  if (agreementContext) await agreementContext.close().catch(() => {});
+  agreementContext = null;
+  agreementPage = null;
+  agreementStartedAt = null;
+}
 
-  manualContext = null;
-  manualPage = null;
+async function openAgreementSession() {
+  const page = await getAgreementPage();
+
+  await page.goto(ELIFE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+  await waitSoft(page, 3000);
+
+  try {
+    const loginResult = await loginIfNeeded(page);
+    await saveDebugFiles(page);
+    return { loginResult, status: await getPageStatus(page) };
+  } catch (error) {
+    if (error instanceof ManualActionRequiredError || error.manualActionRequired) {
+      await saveDebugFiles(page);
+      return {
+        loginResult: {
+          attempted: true,
+          success: false,
+          manualActionRequired: true,
+          reason: "SUPPLIER_AGREEMENT"
+        },
+        status: await getPageStatus(page)
+      };
+    }
+    throw error;
+  }
 }
 
 async function goToRidePool(page) {
@@ -386,14 +373,10 @@ async function goToRidePool(page) {
 
   if (await detectSupplierAgreement(page)) {
     await saveDebugFiles(page);
-    throw new ManualActionRequiredError(
-      "SUPPLIER_AGREEMENT",
-      "Elife requiere acción manual en Supplier Agreement antes de continuar."
-    );
+    throw new ManualActionRequiredError("SUPPLIER_AGREEMENT", "Elife requiere aprobación humana para Supplier Agreement.");
   }
 
-  const loginResult = await maybeLogin(page, false);
-
+  const loginResult = await loginIfNeeded(page);
   if (!loginResult.success) {
     await saveDebugFiles(page);
     throw new Error(loginResult.message);
@@ -405,10 +388,7 @@ async function goToRidePool(page) {
 
   if (await detectSupplierAgreement(page)) {
     await saveDebugFiles(page);
-    throw new ManualActionRequiredError(
-      "SUPPLIER_AGREEMENT",
-      "Elife requiere acción manual en Supplier Agreement antes de continuar."
-    );
+    throw new ManualActionRequiredError("SUPPLIER_AGREEMENT", "Elife requiere aprobación humana para Supplier Agreement.");
   }
 
   const ridePoolText = page.locator("text=/Ride\\s*Pool/i").first();
@@ -424,40 +404,9 @@ async function goToRidePool(page) {
   }
 }
 
-async function extractRideBlocksFromAcceptButtons(page) {
-  return await page.evaluate(() => {
-    const candidates = Array.from(
-      document.querySelectorAll("button, [role='button'], a, div, span")
-    ).filter((element) => {
-      const text = element.textContent || "";
-      return /accept/i.test(text);
-    });
-
-    const blocks = [];
-
-    for (const candidate of candidates) {
-      let current = candidate;
-
-      for (let level = 0; level < 10 && current; level++) {
-        const text = current.innerText || current.textContent || "";
-
-        if (/USD\s*\d+/i.test(text) && text.length > 20 && text.length < 2500) {
-          blocks.push(text);
-          break;
-        }
-
-        current = current.parentElement;
-      }
-    }
-
-    return blocks;
-  });
-}
-
 function parseRideFromText(rawText) {
   const text = normalizeText(rawText);
   const lines = text.split("\n").map((line) => normalizeText(line)).filter(Boolean);
-
   const priceMatch = text.match(/USD\s*\d+(?:\.\d+)?/i);
   const dateMatch = text.match(/\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}\s*(?:AM|PM)?/i);
 
@@ -487,6 +436,28 @@ function parseRideFromText(rawText) {
   };
 }
 
+async function extractRideBlocksFromAcceptButtons(page) {
+  return await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll("button, [role='button'], a, div, span")).filter((element) => {
+      const text = element.textContent || "";
+      return /accept/i.test(text);
+    });
+    const blocks = [];
+    for (const candidate of candidates) {
+      let current = candidate;
+      for (let level = 0; level < 10 && current; level++) {
+        const text = current.innerText || current.textContent || "";
+        if (/USD\s*\d+/i.test(text) && text.length > 20 && text.length < 2500) {
+          blocks.push(text);
+          break;
+        }
+        current = current.parentElement;
+      }
+    }
+    return blocks;
+  });
+}
+
 async function extractRides(page) {
   await waitSoft(page, 2000);
   const ridesById = new Map();
@@ -494,9 +465,7 @@ async function extractRides(page) {
 
   for (const block of blocks) {
     const cleaned = normalizeText(block);
-    if (!cleaned) continue;
-    if (!/USD\s*\d+/i.test(cleaned)) continue;
-
+    if (!cleaned || !/USD\s*\d+/i.test(cleaned)) continue;
     const ride = parseRideFromText(block);
     ridesById.set(ride.id, ride);
   }
@@ -507,7 +476,6 @@ async function extractRides(page) {
       .split(/Accept/i)
       .map((chunk) => chunk.trim())
       .filter((chunk) => /USD\s*\d+/i.test(chunk));
-
     for (const block of fallbackBlocks) {
       const ride = parseRideFromText(block);
       ridesById.set(ride.id, ride);
@@ -520,8 +488,8 @@ async function extractRides(page) {
 async function checkElife() {
   const checkedAt = new Date().toISOString();
 
-  if (manualContext) {
-    throw new Error("Hay una sesión manual abierta. Ejecuta /manual/finish antes de /check.");
+  if (agreementContext) {
+    throw new Error("Hay una sesión de agreement abierta. Ejecuta /agreement/cancel o /agreement/approve antes de /check.");
   }
 
   const context = await launchPersistent();
@@ -534,17 +502,13 @@ async function checkElife() {
 
     const seenState = await loadSeenState();
     const seenRideIds = seenState.ids;
-
     let newRides = rides.filter((ride) => !seenRideIds.has(ride.id));
 
     if (!seenState.existed && BASELINE_ON_FIRST_RUN) {
       newRides = [];
     }
 
-    for (const ride of rides) {
-      seenRideIds.add(ride.id);
-    }
-
+    for (const ride of rides) seenRideIds.add(ride.id);
     await saveSeenState(seenRideIds);
 
     return {
@@ -562,17 +526,68 @@ async function checkElife() {
   }
 }
 
+async function scrollAgreementToBottom(page) {
+  for (let i = 0; i < 12; i++) {
+    await page.evaluate(() => window.scrollBy(0, Math.max(window.innerHeight * 0.85, 700)));
+    await waitSoft(page, 600);
+  }
+}
+
+async function clickAgreementConfirmation(page) {
+  await scrollAgreementToBottom(page);
+
+  await page.evaluate(() => {
+    const boxes = Array.from(document.querySelectorAll("input[type='checkbox']"));
+    for (const box of boxes) {
+      if (!box.checked && !box.disabled) box.click();
+    }
+  }).catch(() => {});
+
+  await waitSoft(page, 1000);
+
+  const result = await page.evaluate(() => {
+    const acceptedTexts = ["accept", "agree", "i agree", "i accept", "confirm", "continue", "submit", "ok"];
+
+    function isVisible(el) {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+    }
+
+    const elements = Array.from(document.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit'], a, div, span"));
+    const target = elements.find((el) => {
+      const rawText = (el.innerText || el.textContent || el.value || "").trim().toLowerCase();
+      if (!rawText) return false;
+      if (!isVisible(el)) return false;
+      if (el.disabled || el.getAttribute("aria-disabled") === "true") return false;
+      return acceptedTexts.some((candidate) => rawText === candidate || rawText.includes(candidate));
+    });
+
+    if (!target) return { clicked: false, reason: "NO_BUTTON_FOUND" };
+
+    target.scrollIntoView({ block: "center", inline: "center" });
+    target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+
+    return { clicked: true, text: (target.innerText || target.textContent || target.value || "").trim() };
+  });
+
+  await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+  await waitSoft(page, 4000);
+  await saveDebugFiles(page);
+
+  return result;
+}
+
 function requireApiKey(req, res, next) {
   if (!WATCHER_API_KEY) {
     return res.status(500).json({ ok: false, error: "WATCHER_API_KEY no está configurado" });
   }
-
   const providedKey = req.headers["x-api-key"] || req.query.token;
-
   if (providedKey !== WATCHER_API_KEY) {
     return res.status(401).json({ ok: false, error: "No autorizado" });
   }
-
   next();
 }
 
@@ -586,7 +601,6 @@ app.get("/check", requireApiKey, async (req, res) => {
   }
 
   isChecking = true;
-
   try {
     const result = await checkElife();
     return res.json(result);
@@ -616,92 +630,80 @@ app.get("/check", requireApiKey, async (req, res) => {
   }
 });
 
-app.post("/manual/start", requireApiKey, async (req, res) => {
+app.post("/agreement/start", requireApiKey, async (req, res) => {
   if (isChecking) {
     return res.status(409).json({ ok: false, error: "Hay un chequeo en proceso. Intenta de nuevo en unos segundos." });
   }
 
   try {
-    const page = await getManualPage();
-    await page.goto(ELIFE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-    await waitSoft(page, 3000);
-
-    const loginResult = await maybeLogin(page, true);
-    await saveDebugFiles(page);
-
-    return res.json({
-      ok: true,
-      manualSession: true,
-      loginResult,
-      status: await getPageStatus(page)
-    });
+    const result = await openAgreementSession();
+    return res.json({ ok: true, agreementSessionActive: true, startedAt: agreementStartedAt, ...result });
   } catch (error) {
-    if (manualPage) await saveDebugFiles(manualPage);
+    if (agreementPage) await saveDebugFiles(agreementPage);
     return res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-app.get("/manual/status", requireApiKey, async (req, res) => {
-  if (!manualPage) {
-    return res.status(404).json({ ok: false, error: "No hay sesión manual activa. Ejecuta POST /manual/start." });
+app.get("/agreement/status", requireApiKey, async (req, res) => {
+  if (!agreementPage) {
+    return res.status(404).json({ ok: false, error: "No hay sesión de agreement activa. Ejecuta POST /agreement/start." });
   }
-
-  await saveDebugFiles(manualPage);
-  res.json({ ok: true, manualSession: true, status: await getPageStatus(manualPage) });
+  await saveDebugFiles(agreementPage);
+  res.json({ ok: true, agreementSessionActive: true, startedAt: agreementStartedAt, status: await getPageStatus(agreementPage) });
 });
 
-app.post("/manual/scroll", requireApiKey, async (req, res) => {
-  if (!manualPage) {
-    return res.status(404).json({ ok: false, error: "No hay sesión manual activa. Ejecuta POST /manual/start." });
+app.post("/agreement/scroll", requireApiKey, async (req, res) => {
+  if (!agreementPage) {
+    return res.status(404).json({ ok: false, error: "No hay sesión de agreement activa. Ejecuta POST /agreement/start." });
   }
-
   const amount = Number(req.body?.amount ?? 900);
-
-  await manualPage.evaluate((scrollAmount) => {
-    window.scrollBy(0, scrollAmount);
-  }, amount);
-
-  await waitSoft(manualPage, 1000);
-  await saveDebugFiles(manualPage);
-
-  res.json({ ok: true, manualSession: true, status: await getPageStatus(manualPage) });
+  await agreementPage.evaluate((scrollAmount) => window.scrollBy(0, scrollAmount), amount);
+  await waitSoft(agreementPage, 1000);
+  await saveDebugFiles(agreementPage);
+  res.json({ ok: true, agreementSessionActive: true, status: await getPageStatus(agreementPage) });
 });
 
-app.post("/manual/click", requireApiKey, async (req, res) => {
-  if (!manualPage) {
-    return res.status(404).json({ ok: false, error: "No hay sesión manual activa. Ejecuta POST /manual/start." });
+app.post("/agreement/approve", requireApiKey, async (req, res) => {
+  if (!agreementPage) {
+    return res.status(404).json({ ok: false, error: "No hay sesión de agreement activa. Ejecuta POST /agreement/start." });
   }
 
-  const x = Number(req.body?.x);
-  const y = Number(req.body?.y);
+  const confirmation = normalizeText(req.body?.confirmation || "").toUpperCase();
+  const allowed = new Set(["ACEPTO", "ACEPTO EL SUPPLIER AGREEMENT", "APRUEBO", "I AGREE", "I ACCEPT"]);
 
-  if (!Number.isFinite(x) || !Number.isFinite(y)) {
-    return res.status(400).json({ ok: false, error: "Envía coordenadas JSON válidas: {\"x\": 100, \"y\": 200}" });
+  if (!allowed.has(confirmation)) {
+    return res.status(400).json({ ok: false, error: "Confirmación inválida. Debe ser exactamente: ACEPTO" });
   }
 
-  await manualPage.mouse.click(x, y);
-  await manualPage.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-  await waitSoft(manualPage, 2000);
-  await saveDebugFiles(manualPage);
+  const clickResult = await clickAgreementConfirmation(agreementPage);
+  const status = await getPageStatus(agreementPage);
+  const stillAgreement = status.state === "SUPPLIER_AGREEMENT";
 
-  res.json({ ok: true, manualSession: true, clicked: { x, y }, status: await getPageStatus(manualPage) });
+  if (!stillAgreement) {
+    await closeAgreementSession();
+  }
+
+  res.json({
+    ok: !stillAgreement,
+    agreementApproved: !stillAgreement,
+    clickResult,
+    status,
+    message: stillAgreement
+      ? "Se intentó aprobar, pero la página sigue en Supplier Agreement. Revisa screenshot."
+      : "Agreement aprobado y sesión cerrada. Ya puedes ejecutar /check."
+  });
 });
 
-app.post("/manual/finish", requireApiKey, async (req, res) => {
-  if (manualPage) {
-    await saveDebugFiles(manualPage);
-  }
-
-  await closeManualSession();
-
-  res.json({ ok: true, message: "Sesión manual cerrada. Ya puedes ejecutar GET /check." });
+app.post("/agreement/cancel", requireApiKey, async (req, res) => {
+  await closeAgreementSession();
+  res.json({ ok: true, message: "Sesión de agreement cancelada." });
 });
 
 app.get("/debug/status", requireApiKey, async (req, res) => {
   res.json({
     ok: true,
-    manualSessionActive: Boolean(manualContext),
+    agreementSessionActive: Boolean(agreementContext),
+    agreementStartedAt,
     screenshot: await fileInfo(DEBUG_SCREENSHOT_FILE),
     html: await fileInfo(DEBUG_HTML_FILE),
     text: await fileInfo(DEBUG_TEXT_FILE),
@@ -715,7 +717,7 @@ app.get("/debug/html", requireApiKey, async (req, res) => {
     await fs.access(DEBUG_HTML_FILE);
     res.type("html").sendFile(DEBUG_HTML_FILE);
   } catch {
-    res.status(404).json({ ok: false, error: "No existe last-page.html todavía. Ejecuta /check o /manual/start primero." });
+    res.status(404).json({ ok: false, error: "No existe last-page.html todavía." });
   }
 });
 
@@ -724,17 +726,17 @@ app.get("/debug/text", requireApiKey, async (req, res) => {
     await fs.access(DEBUG_TEXT_FILE);
     res.type("text/plain").sendFile(DEBUG_TEXT_FILE);
   } catch {
-    res.status(404).json({ ok: false, error: "No existe last-body.txt todavía. Ejecuta /check o /manual/start primero." });
+    res.status(404).json({ ok: false, error: "No existe last-body.txt todavía." });
   }
 });
 
 app.get("/debug/screenshot", requireApiKey, async (req, res) => {
   try {
-    if (manualPage) await saveDebugFiles(manualPage);
+    if (agreementPage) await saveDebugFiles(agreementPage);
     await fs.access(DEBUG_SCREENSHOT_FILE);
     res.type("png").sendFile(DEBUG_SCREENSHOT_FILE);
   } catch {
-    res.status(404).json({ ok: false, error: "No existe last-screenshot.png todavía. Ejecuta /check o /manual/start primero." });
+    res.status(404).json({ ok: false, error: "No existe last-screenshot.png todavía." });
   }
 });
 
@@ -742,11 +744,9 @@ app.post("/debug/clear-browser", requireApiKey, async (req, res) => {
   if (isChecking) {
     return res.status(409).json({ ok: false, error: "Hay un chequeo en proceso. Intenta limpiar el navegador en unos segundos." });
   }
-
-  await closeManualSession();
+  await closeAgreementSession();
   await removePath(USER_DATA_DIR);
   await fs.mkdir(USER_DATA_DIR, { recursive: true });
-
   res.json({ ok: true, message: "Sesión del navegador eliminada correctamente", userDataDir: USER_DATA_DIR });
 });
 
@@ -754,15 +754,13 @@ app.post("/debug/clear-all", requireApiKey, async (req, res) => {
   if (isChecking) {
     return res.status(409).json({ ok: false, error: "Hay un chequeo en proceso. Intenta limpiar datos en unos segundos." });
   }
-
-  await closeManualSession();
+  await closeAgreementSession();
   await removePath(USER_DATA_DIR);
   await removePath(SEEN_RIDES_FILE);
   await removePath(DEBUG_SCREENSHOT_FILE);
   await removePath(DEBUG_HTML_FILE);
   await removePath(DEBUG_TEXT_FILE);
   await fs.mkdir(USER_DATA_DIR, { recursive: true });
-
   res.json({ ok: true, message: "Datos del watcher eliminados correctamente" });
 });
 

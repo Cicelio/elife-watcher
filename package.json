@@ -1,7 +1,7 @@
 {
   "name": "elife-watcher",
-  "version": "1.0.5",
-  "description": "Watcher para detectar viajes nuevos en Elife Ride Pool y avisar a n8n",
+  "version": "1.0.6",
+  "description": "Watcher para detectar viajes nuevos en Elife Ride Pool con aprobacion humana por Telegram/n8n",
   "main": "server.js",
   "type": "module",
   "scripts": {
